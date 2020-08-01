@@ -6,8 +6,10 @@ use Getopt::Long;
 use LWP::UserAgent;
 use Digest::SHA 'sha256_hex';
 use MIME::Base64;
-use JSON;
 use POSIX 'strftime';
+use File::LibMagic;
+use File::Path 'make_path';
+use JSON;
 
 # Read lines from input file into array
 sub read_file_lines {
@@ -18,7 +20,7 @@ sub read_file_lines {
   }
   my $lines;
   while (<$fh>) {
-    chomp($_);
+    $_ =~ s/\r?\n//g;
     push(@{$lines}, $_);
   }
   return $lines;
@@ -98,6 +100,8 @@ sub make_http_request {
   my $url = shift;
 
   my $ua = LWP::UserAgent->new();
+  # Only give the server 5s if no activity is ongoing
+  $ua->timeout(5);
   $ua->agent(get_random_ua_string());
   my $request = get_request($url);
 
@@ -180,11 +184,11 @@ sub main {
   if (defined($ref_file)) {
     @REFERERS = @{read_file_lines($ref_file)};
   }
-
   ensure_outdir($out_dir);
 
   my @urls = @{read_file_lines($url_list_file)};
   my $url_index = 0;
+  my $identifier = File::LibMagic->new();
   foreach my $url (@urls) {
     my $start_time_string = strftime("%FT%T%Z", gmtime());
     my ($request, $response, $local_port) = make_http_request($url);
@@ -195,7 +199,10 @@ sub main {
     # charset => none SHOULD return a byte stream (result of Encode)
     # and only 'decode' transfer encoding (gzip, chunk, etc.) and not charset
     my $content = $response->decoded_content('charset' => 'none');
-    my ($dest_addr, $dest_port) = split(/:([0-9]+)$/, $response->header('Client-Peer'));
+    my ($dest_addr, $dest_port);
+    if (defined($response->header('Client-Peer'))) {
+       ($dest_addr, $dest_port) = split(/:([0-9]+)$/, $response->header('Client-Peer'));
+    }
 
     # Create metadata about this download
     my $result = {
@@ -210,14 +217,29 @@ sub main {
       'response_status_message' => $response->message(),
       'response_headers' => $response_headers_map,
     };
-    $result->{'content_sha256'} = sha256_hex($content);
+    if (not defined($content)) {
+      print("[ $url ] did not have any content returned\n");
+      $result->{'content_sha256'} = "NO_CONTENT";
+    }
+    else {
+      $result->{'content_sha256'} = sha256_hex($content);
+      $result->{'libmagic_info'} = $identifier->info_from_string($content)
+    }
 
     ## TODO: This should probably be functionized if used more than just these 2 times
     # Save metadata to file in subdirectory for SHA256 sum named for the index of the URL it came from
     my $fh = IO::File->new();
-    my $subdir_name = "$out_dir/$result->{'content_sha256'}";
+    my $mime_fixed;
+    if (defined($result->{'libmagic_info'})) {
+      $mime_fixed = $result->{'libmagic_info'}->{'mime_type'};
+      $mime_fixed =~ s#/#__#g;
+		}
+    else {
+      $mime_fixed = "NO_MIMETYPE";
+    }
+    my $subdir_name = "$out_dir/$mime_fixed/$result->{'content_sha256'}";
     if (! -d $subdir_name) {
-      mkdir($subdir_name) or die "Could not create the subdirectory [ $subdir_name ] to write files into: $!\n";
+      make_path($subdir_name);
     }
     my $metafile_name = "$subdir_name/$url_index.json";
     unless ($fh->open("$metafile_name", "w")) {
@@ -227,16 +249,17 @@ sub main {
     $fh->binmode(':encoding(UTF-8)');
     $fh->write(to_json($result, {utf8 => 1, pretty => 1, convert_blessed => 1, canonical => 1})) or die "Failed to write to [ $metafile_name ]: $!\n";
 
-    ## TODO: This should probably be functionized if used more than just these 2 times
-    # Save data to file in subdirectory for SHA256 sum named for the index of the URL it came from
-    my $datafile_name = "$subdir_name/$url_index.dat";
-    $fh = IO::File->new();
-    unless ($fh->open("$datafile_name", "w")) {
-      die "Could not open [ $datafile_name ] for writing: $!\n";
-      $fh->binmode(':raw');
+    if (defined($content)) {
+      ## TODO: This should probably be functionized if used more than just these 2 times
+      # Save data to file in subdirectory for SHA256 sum named for the index of the URL it came from
+      my $datafile_name = "$subdir_name/$url_index.dat";
+      $fh = IO::File->new();
+      unless ($fh->open("$datafile_name", "w")) {
+        die "Could not open [ $datafile_name ] for writing: $!\n";
+        $fh->binmode(':raw');
+      }
+      $fh->write($content) or die "Failed to write to [ $datafile_name ]: $!\n";
     }
-    $fh->write($content) or die "Failed to write to [ $datafile_name ]: $!\n";
-
 
     $url_index++;
   }
