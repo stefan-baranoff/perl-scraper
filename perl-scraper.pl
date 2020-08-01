@@ -202,6 +202,8 @@ sub main {
     my ($dest_addr, $dest_port);
     if (defined($response->header('Client-Peer'))) {
        ($dest_addr, $dest_port) = split(/:([0-9]+)$/, $response->header('Client-Peer'));
+       # Number-ify dest_port
+       $dest_port = $dest_port + 0;
     }
 
     # Create metadata about this download
