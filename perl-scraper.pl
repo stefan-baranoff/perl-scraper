@@ -10,6 +10,10 @@ use POSIX 'strftime';
 use File::LibMagic;
 use File::Path 'make_path';
 use JSON;
+use IO::Socket::SSL;
+
+# Disable line buffering to stdout -- lower throughput but lower latency
+$| = 1;
 
 # Read lines from input file into array
 sub read_file_lines {
@@ -99,16 +103,44 @@ sub get_request {
 sub make_http_request {
   my $url = shift;
 
-  my $ua = LWP::UserAgent->new();
-  # Only give the server 5s if no activity is ongoing
-  $ua->timeout(5);
+  my $ua = LWP::UserAgent->new(
+    ssl_opts => {
+      'SSL_verify_mode' => SSL_VERIFY_NONE,
+      'verify_hostname' => 0
+    }
+  );
+  # Only give the server limited time if no activity is ongoing
+  $ua->timeout(15);
   $ua->agent(get_random_ua_string());
   my $request = get_request($url);
 
   my $port = get_sport();
   $ua->local_address("0.0.0.0:${port}");
 
-  my $response = $ua->request($request);
+  my $response = undef;
+  my $retries = 0;
+  # Try up to 3 times if a failure happens
+  while ($retries < 3) {
+    print("Try ${retries} - requesting [ $url ]... ");
+    $response = $ua->request($request);
+    if (not $response->is_success()) {
+      if (defined($response->headers('Client-Warning')) &&
+          $response->message() =~ /Can't connect to .* \(Address already in use\)/) {
+        print("retrying without specified source port - address in use...\n");
+        $port = undef;
+        $ua->local_address(undef);
+      }
+      else {
+        print("FAILED with: " . $response->message() . "\n");
+      }
+      $retries++;
+    }
+    else {
+      print("DONE with: " . $response->message() . "\n");
+      # Normal return when things worked
+      return ($request, $response, $port);
+    }
+  }
   return ($request, $response, $port);
 }
 
