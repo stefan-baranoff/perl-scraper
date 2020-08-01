@@ -219,7 +219,11 @@ sub main {
       'response_status_message' => $response->message(),
       'response_headers' => $response_headers_map,
     };
-    if (not defined($content)) {
+    if ($response->code() >= 400 && defined($response->header('Client-Warning'))) {
+      print("[ $url ] had an internal error (probably failure to connect)\n");
+      $result->{'content_sha256'} = "INTERNAL_ERROR";
+    }
+    elsif (not defined($content)) {
       print("[ $url ] did not have any content returned\n");
       $result->{'content_sha256'} = "NO_CONTENT";
     }
@@ -235,7 +239,7 @@ sub main {
     if (defined($result->{'libmagic_info'})) {
       $mime_fixed = $result->{'libmagic_info'}->{'mime_type'};
       $mime_fixed =~ s#/#__#g;
-		}
+    }
     else {
       $mime_fixed = "NO_MIMETYPE";
     }
