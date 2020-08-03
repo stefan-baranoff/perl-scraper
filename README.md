@@ -1,18 +1,11 @@
 # perl-scraper
 
 ## Installing
-If you're on CentOS 8 ensure the PowerTools repo is enabled: `sudo vim /etc/yum.repos.d/CentOS-PowerTools.repo` and change `enabled=0` to `enabled=1`
+If you're on CentOS 6 there's an EPEL provided File::LibMagic (maybe there's one in CentOS 8 I'm missing) but it has an older API. These should work -- the second yum install is to ensure epel-release installed properly
 
 ```
-sudo yum install -y perl-LWP-Protocol-https perl-JSON cpan gcc file-devel
-sudo cpan install File::LibMagic
+sudo yum install -y perl-LWP-Protocol-https perl-JSON cpan file-devel epel-release && sudo yum install -y perl-File-LibMagic
 ```
-
-The install of `gcc` is for `cpan` which is for installing `File::LibMagic`
-
-If you take out the 'save by file type' stuff you can drop this back to just
-`sudo yum install -y perl-LWP-Protocol-https perl-JSON`
-
 ## Running
 This is pretty self explanatory
 `./perl-scraper.pl -u /path/to/file/with/url/list -o /path/to/some/output/directory`

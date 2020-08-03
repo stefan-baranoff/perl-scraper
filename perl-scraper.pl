@@ -267,7 +267,7 @@ sub main {
     }
     else {
       $result->{'content_sha256'} = sha256_hex($content);
-      $result->{'libmagic_info'} = $identifier->info_from_string($content)
+      $result->{'libmagic_info'} = $identifier->checktype_contents($content)
     }
 
     ## TODO: This should probably be functionized if used more than just these 2 times
@@ -275,8 +275,9 @@ sub main {
     my $fh = IO::File->new();
     my $mime_fixed;
     if (defined($result->{'libmagic_info'})) {
-      $mime_fixed = $result->{'libmagic_info'}->{'mime_type'};
+      $mime_fixed = $result->{'libmagic_info'};
       $mime_fixed =~ s#/#__#g;
+      $mime_fixed =~ s/;[^;]*//g;
     }
     else {
       $mime_fixed = "NO_MIMETYPE";
