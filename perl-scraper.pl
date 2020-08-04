@@ -11,6 +11,7 @@ use File::LibMagic;
 use File::Path 'make_path';
 use JSON;
 use IO::Socket::SSL;
+use LWP::Protocol::http;
 
 # Disable line buffering to stdout -- lower throughput but lower latency
 $| = 1;
@@ -103,24 +104,27 @@ sub get_request {
 sub make_http_request {
   my $url = shift;
 
-  my $ua = LWP::UserAgent->new(
-    ssl_opts => {
-      'SSL_verify_mode' => SSL_VERIFY_NONE,
-      'verify_hostname' => 0
-    }
-  );
-  # Only give the server limited time if no activity is ongoing
-  $ua->timeout(15);
-  $ua->agent(get_random_ua_string());
-  my $request = get_request($url);
-
-  my $port = get_sport();
-  $ua->local_address("0.0.0.0:${port}");
-
-  my $response = undef;
-  my $retries = 0;
   # Try up to 3 times if a failure happens
+  my $response = undef;
+  my $request = undef;
+  my $retries = 0;
+  my $port = get_sport();
+  @LWP::Protocol::http::EXTRA_SOCK_OPTS=( LocalPort => $port );
   while ($retries < 3) {
+    my $ua = LWP::UserAgent->new(
+      ssl_opts => {
+        'SSL_verify_mode' => SSL_VERIFY_NONE,
+        'verify_hostname' => 0
+      }
+    );
+    # Only give the server limited time if no activity is ongoing
+    $ua->timeout(15);
+    $ua->agent(get_random_ua_string());
+    my $request = get_request($url);
+
+    # Newer way, but HTTPS always breaks it...
+    #$ua->local_address("0.0.0.0:${port}");
+
     print("Try ${retries} - requesting [ $url ]... ");
     $response = $ua->request($request);
     if (not $response->is_success()) {
@@ -128,7 +132,9 @@ sub make_http_request {
           $response->message() =~ /Can't connect to .* \(Address already in use\)/) {
         print("retrying without specified source port - address in use...\n");
         $port = undef;
-        $ua->local_address(undef);
+        @LWP::Protocol::http::EXTRA_SOCK_OPTS=undef;
+        # Newer way, but HTTPS always breaks it...
+	# $ua->local_address(undef);
       }
       else {
         print("FAILED with: " . $response->message() . "\n");
