@@ -11,7 +11,23 @@ use File::LibMagic;
 use File::Path 'make_path';
 use JSON;
 use IO::Socket::SSL;
-use LWP::Protocol::http;
+
+# Monkey-patch LWP::Protocol::http to get local address/port information along with remote information
+BEGIN {
+  use LWP::Protocol::http;
+  no warnings 'redefine';
+  *LWP::Protocol::http::_get_sock_info = sub
+  {
+      my($self, $res, $sock) = @_;
+      if (defined(my $peerhost = $sock->peerhost)) {
+          $res->header("Client-Peer" => "$peerhost:" . $sock->peerport);
+      }
+      if (defined(my $sockhost = $sock->sockhost)) {
+          $res->header("Client-Sock" => "$sockhost:" . $sock->sockport);
+      }
+  };
+  use warnings 'redefine';
+}
 
 # Disable line buffering to stdout -- lower throughput but lower latency
 $| = 1;
@@ -29,11 +45,6 @@ sub read_file_lines {
     push(@{$lines}, $_);
   }
   return $lines;
-}
-
-# Get a random source port to use for each request, so we know what it is
-sub get_sport {
-  return int(rand(64511)) + 1024;
 }
 
 # A list of user-agents to randomly rotate through
@@ -104,12 +115,10 @@ sub get_request {
 sub make_http_request {
   my $url = shift;
 
-  # Try up to 3 times if a failure happens
   my $response = undef;
   my $request = undef;
   my $retries = 0;
-  my $port = get_sport();
-  @LWP::Protocol::http::EXTRA_SOCK_OPTS=( LocalPort => $port );
+  # Try up to 3 times if a failure happens
   while ($retries < 3) {
     my $ua = LWP::UserAgent->new(
       ssl_opts => {
@@ -120,34 +129,21 @@ sub make_http_request {
     # Only give the server limited time if no activity is ongoing
     $ua->timeout(15);
     $ua->agent(get_random_ua_string());
-    my $request = get_request($url);
-
-    # Newer way, but HTTPS always breaks it...
-    #$ua->local_address("0.0.0.0:${port}");
+    $request = get_request($url);
 
     print("Try ${retries} - requesting [ $url ]... ");
     $response = $ua->request($request);
     if (not $response->is_success()) {
-      if (defined($response->headers('Client-Warning')) &&
-          $response->message() =~ /Can't connect to .* \(Address already in use\)/) {
-        print("retrying without specified source port - address in use...\n");
-        $port = undef;
-        @LWP::Protocol::http::EXTRA_SOCK_OPTS=undef;
-        # Newer way, but HTTPS always breaks it...
-	# $ua->local_address(undef);
-      }
-      else {
-        print("FAILED with: " . $response->message() . "\n");
-      }
+      print("FAILED with: " . $response->message() . " - " . length($response->content()) . " bytes content\n");
       $retries++;
     }
     else {
-      print("DONE with: " . $response->message() . "\n");
+      print("DONE with: " . $response->message() . " - " . length($response->content()) . " bytes content\n");
       # Normal return when things worked
-      return ($request, $response, $port);
+      return ($request, $response);
     }
   }
-  return ($request, $response, $port);
+  return ($request, $response);
 }
 
 # Convert an HTTP::Headers object into a structured K/V store
@@ -229,7 +225,7 @@ sub main {
   my $identifier = File::LibMagic->new();
   foreach my $url (@urls) {
     my $start_time_string = strftime("%FT%T%Z", gmtime());
-    my ($request, $response, $local_port) = make_http_request($url);
+    my ($request, $response) = make_http_request($url);
     my $stop_time_string = strftime("%FT%T%Z", gmtime());
 
     my $request_headers_map = get_headers_map($request->headers());
@@ -237,11 +233,16 @@ sub main {
     # charset => none SHOULD return a byte stream (result of Encode)
     # and only 'decode' transfer encoding (gzip, chunk, etc.) and not charset
     my $content = $response->decoded_content('charset' => 'none');
-    my ($dest_addr, $dest_port);
+    my ($dest_addr, $dest_port, $src_addr, $src_port);
     if (defined($response->header('Client-Peer'))) {
        ($dest_addr, $dest_port) = split(/:([0-9]+)$/, $response->header('Client-Peer'));
        # Number-ify dest_port
        $dest_port = $dest_port + 0;
+    }
+    if (defined($response->header('Client-Sock'))) {
+       ($src_addr, $src_port) = split(/:([0-9]+)$/, $response->header('Client-Sock'));
+       # Number-ify src_port
+       $src_port = $src_port + 0;
     }
 
     # Create metadata about this download
@@ -249,7 +250,8 @@ sub main {
       'start_timestamp' => $start_time_string,
       'stop_timestamp' => $stop_time_string,
       'url' => $url,
-      'source_port' => $local_port,
+      'source_address' => $src_addr,
+      'source_port' => $src_port,
       'destination_address' => $dest_addr,
       'destination_port' => $dest_port,
       'request_headers' => $request_headers_map,
@@ -258,11 +260,9 @@ sub main {
       'response_headers' => $response_headers_map,
     };
     if ($response->code() >= 400 && defined($response->header('Client-Warning'))) {
-      print("[ $url ] had an internal error (probably failure to connect)\n");
       $result->{'content_sha256'} = "INTERNAL_ERROR";
     }
     elsif (not defined($content)) {
-      print("[ $url ] did not have any content returned\n");
       $result->{'content_sha256'} = "NO_CONTENT";
     }
     else {
