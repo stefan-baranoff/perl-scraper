@@ -194,7 +194,7 @@ sub find_json_check {
     $sth->finish();
     $fh = IO::File->new($File::Find::name, "w");
     $fh->binmode(':encoding(UTF-8)');
-    $fh->write(to_json($json, {utf8 => 1, pretty => 1, canonical => 1})) or die "Failed to update [ $$File::Find::name ]: $!\n";
+    $fh->write(to_json($json, {utf8 => 1, pretty => 1, canonical => 1})) or die "Failed to update [ $File::Find::name ]: $!\n";
     $fh->close();
   } 
 }
