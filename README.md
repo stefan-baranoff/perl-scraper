@@ -1,7 +1,7 @@
 # perl-scraper
 
 ## Installing
-If you're on CentOS 6 there's an EPEL provided File::LibMagic (maybe there's one in CentOS 8 I'm missing) but it has an older API. These should work -- the second yum install is to ensure epel-release installed properly
+If you're on CentOS there's an EPEL provided File::LibMagic (maybe there's one in CentOS 8 I'm missing) but it has an older API. These should work -- the second yum install is to ensure epel-release installed properly
 
 ```
 sudo yum install -y perl-LWP-Protocol-https perl-JSON cpan file-devel epel-release && sudo yum install -y perl-File-LibMagic
