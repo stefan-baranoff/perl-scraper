@@ -74,6 +74,10 @@ query ExampleQuery($afterCursor: String, $filter: EventFilter) {
         formula {
           formulaId
         }
+        source
+        sourcePort
+        destination
+        destinationPort
         applicationData {
           __typename
           ... on HttpRequestData {
@@ -91,7 +95,7 @@ EOL
 my $lastCursorOnPage = undef;
 
 my $dbh = DBI->connect('DBI:SQLite:dbname=:memory:', '', '', { RaiseError => 1 }) or die $DBI::errstr;
-if ($dbh->do('CREATE TABLE tc_correlate (action_time TEXT, host TEXT, path TEXT, user_agent TEXT, formula_id INTEGER)') < 0) {
+if ($dbh->do('CREATE TABLE tc_correlate (action_time TEXT, host TEXT, path TEXT, user_agent TEXT, formula_id INTEGER, source TEXT, source_port INTEGER, destination TEXT, destination_port INTEGER)') < 0) {
   die $DBI::errstr;
 }
 $dbh->begin_work;
@@ -128,12 +132,16 @@ while ($haveMorePages) {
       my $node = $nodeContainer->{'node'};
       foreach my $appData (@{$node->{'applicationData'}}) {
         if ($appData->{'__typename'} eq 'HttpRequestData') {
-          my $sth = $dbh->prepare('INSERT INTO tc_correlate (action_time, host, path, user_agent, formula_id) VALUES (?, ?, ?, ?, ?)');
+          my $sth = $dbh->prepare('INSERT INTO tc_correlate (action_time, host, path, user_agent, formula_id, source, source_port, destination, destination_port) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)');
           $sth->bind_param(1, $node->{'actionTime'});
           $sth->bind_param(2, $appData->{'host'});
           $sth->bind_param(3, $appData->{'path'});
           $sth->bind_param(4, $appData->{'userAgent'});
       	  $sth->bind_param(5, $node->{'formula'}->{'formulaId'});
+      	  $sth->bind_param(6, $node->{'source'});
+      	  $sth->bind_param(7, $node->{'sourcePort'});
+      	  $sth->bind_param(8, $node->{'destination'});
+      	  $sth->bind_param(9, $node->{'destinationPort'});
           $sth->execute();
         }
       }
@@ -144,9 +152,11 @@ $dbh->commit();
 
 my $results;
 
+my $idx = 1;
 sub find_json_check {
   if ($File::Find::name =~ m#/[0-9]+\.json$#) {
-    print "Enriching $File::Find::name\n";
+    print "$idx - Enriching $File::Find::name\n";
+    $idx++;
     my $fh = IO::File->new($File::Find::name, "r");
     my $json_text;
     {
@@ -155,10 +165,10 @@ sub find_json_check {
     }
     my $json = decode_json($json_text);
     my $url = $json->{'url'};
-    my $user_agent = $json->{'request_headers'}->{'User-Agent'};
+    my $user_agent = $json->{'request_headers'}->{'User-Agent'}->[0];
     my $host;
     my $path;
-    if ($url =~ m#^http(s?)://([^/]*).*$#) {
+    if ($url =~ m#^http(?:s?)://([^/]*)(.*)$#) {
       $host = $1;
       $path = $2;
     }
@@ -168,23 +178,18 @@ sub find_json_check {
     $start_time[0] -= 2;
     my @stop_time = Date::Parse::strptime($json->{'stop_timestamp'});
     $stop_time[0] += 2;
-    my $sth = $dbh->prepare('SELECT formula_id, host, path, user_agent, action_time FROM tc_correlate WHERE host like ? AND path like ? AND user_agent like ? AND action_time BETWEEN ? AND ?');
+    my $sth = $dbh->prepare('SELECT formula_id, host, path, user_agent, action_time, source, source_port, destination, destination_port FROM tc_correlate WHERE host like ? AND path like ? AND INSTR(?, user_agent) > 0 AND action_time BETWEEN ? AND ?');
     $sth->bind_param(1, $host);
     $sth->bind_param(2, $path);
     $sth->bind_param(3, $user_agent);
-    $sth->bind_param(4, strftime("%F %T", @start_time));
-    $sth->bind_param(5, strftime("%F %T", @stop_time));
+    $sth->bind_param(4, strftime("%FT%T", @start_time));
+    $sth->bind_param(5, strftime("%FT%T", @stop_time));
     $sth->execute();
-    my $formula_id;
-    my $action_time;
-    while (($formula_id, $host, $path, $user_agent, $action_time) = $sth->fetchrow()) {
-      push(@{$json->{'trinity_cyber_matches'}}, {
-        'formula_id' => $formula_id,
-        'action_time' => $action_time,
-        'host' => $host,
-        'path' => $path,
-        'user_agent' => $user_agent,
-      })
+    if (exists $json->{'trinity_cyber_matches'}) {
+      delete $json->{'trinity_cyber_matches'};
+    }
+    while (my $rowhash = $sth->fetchrow_hashref()) {
+      push(@{$json->{'trinity_cyber_matches'}}, $rowhash)
     }
     $sth->finish();
     $fh = IO::File->new($File::Find::name, "w");
