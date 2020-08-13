@@ -5,6 +5,7 @@ use warnings;
 use Getopt::Long;
 use LWP::UserAgent;
 use LWP::ConnCache;
+use IO::Socket::SSL;
 use DBI;
 use JSON;
 use File::Find;
@@ -52,11 +53,16 @@ if (defined $end_time) {
 my $cache = LWP::ConnCache->new;
 $cache->total_capacity(10);
 
-my $ua = LWP::UserAgent->new(conn_cache => $cache);
+my $ua = LWP::UserAgent->new(conn_cache => $cache, 
+  ssl_opts => {
+    'SSL_verify_mode' => SSL_VERIFY_NONE,
+    'verify_hostname' => 0
+  }
+);
 
 my $GQL = << 'EOL';
 query ExampleQuery($afterCursor: String, $filter: EventFilter) {
-  events(first: 250, after: $afterCursor, filter: $filter) {
+  events(first: 1000, after: $afterCursor, filter: $filter) {
     totalCount
     pageInfo {
       hasNextPage
@@ -88,7 +94,7 @@ my $dbh = DBI->connect('DBI:SQLite:dbname=:memory:', '', '', { RaiseError => 1 }
 if ($dbh->do('CREATE TABLE tc_correlate (action_time TEXT, host TEXT, path TEXT, user_agent TEXT, formula_id INTEGER)') < 0) {
   die $DBI::errstr;
 }
-$dbh->being_work;
+$dbh->begin_work;
 
 my $haveMorePages = 1;
 while ($haveMorePages) {
@@ -108,9 +114,10 @@ while ($haveMorePages) {
   if (defined $client_id) {
     $req->header('X-Effective-Client-Ids', "$client_id");
   }
+  print "Getting next page...\n";
   my $resp = $ua->request($req);
   if (!$resp->is_success) {
-    print "Failed to make request:\n" . $resp->as_string() . "\n";
+    die "Failed to make request:\n" . $resp->as_string() . "\n";
     $haveMorePages = 0;
   }
   else {
@@ -139,13 +146,14 @@ my $results;
 
 sub find_json_check {
   if ($File::Find::name =~ m#/[0-9]+\.json$#) {
-    my $fh = IO::File->new($File::Find::name, "r+");
+    print "Enriching $File::Find::name\n";
+    my $fh = IO::File->new($File::Find::name, "r");
     my $json_text;
     {
-      local $\ = undef;
+      local $/ = undef;
       $json_text = <$fh>;
     }
-    my $json = json_parse($json_text);
+    my $json = decode_json($json_text);
     my $url = $json->{'url'};
     my $user_agent = $json->{'request_headers'}->{'User-Agent'};
     my $host;
@@ -179,6 +187,10 @@ sub find_json_check {
       })
     }
     $sth->finish();
+    $fh = IO::File->new($File::Find::name, "w");
+    $fh->binmode(':encoding(UTF-8)');
+    $fh->write(to_json($json, {utf8 => 1, pretty => 1, canonical => 1})) or die "Failed to update [ $$File::Find::name ]: $!\n";
+    $fh->close();
   } 
 }
 
