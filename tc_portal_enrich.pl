@@ -175,9 +175,9 @@ sub find_json_check {
     $path = '/' unless defined $path;
     # Account for partial seconds in actino time / clock skew
     my @start_time = Date::Parse::strptime($json->{'start_timestamp'});
-    $start_time[0] -= 2;
+    $start_time[1] -= 15;
     my @stop_time = Date::Parse::strptime($json->{'stop_timestamp'});
-    $stop_time[0] += 2;
+    $stop_time[1] += 15;
     my $sth = $dbh->prepare('SELECT formula_id, host, path, user_agent, action_time, source, source_port, destination, destination_port FROM tc_correlate WHERE host like ? AND path like ? AND INSTR(?, user_agent) > 0 AND action_time BETWEEN ? AND ?');
     $sth->bind_param(1, $host);
     $sth->bind_param(2, $path);
