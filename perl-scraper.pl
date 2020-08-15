@@ -1,6 +1,7 @@
 #!/usr/bin/perl
 use strict;
 use warnings;
+use threads; # Here there be dragons!
 
 use Getopt::Long;
 use LWP::UserAgent;
@@ -11,6 +12,7 @@ use File::LibMagic;
 use File::Path 'make_path';
 use JSON;
 use IO::Socket::SSL;
+use Thread::Queue;
 
 # Monkey-patch LWP::Protocol::http to get local address/port information along with remote information
 BEGIN {
@@ -117,6 +119,7 @@ sub make_http_request {
 
   my $response = undef;
   my $request = undef;
+  my $messages = [];
   my $retries = 0;
   # Try up to 3 times if a failure happens
   while ($retries < 3) {
@@ -130,20 +133,22 @@ sub make_http_request {
     $ua->timeout(15);
     $ua->agent(get_random_ua_string());
     $request = get_request($url);
-
-    print("Try ${retries} - requesting [ $url ]... ");
+    my $timenow = strftime("%FT%T%z", gmtime());
+    push(@{$messages}, "[$timenow] Try ${retries} - requesting [ $url ]... ");
     $response = $ua->request($request);
     if (not $response->is_success()) {
-      print("FAILED with: " . $response->message() . " - " . length($response->content()) . " bytes content\n");
-      $retries++;
+      $timenow = strftime("%FT%T%z", gmtime());
+      push(@{$messages}, "[$timenow] FAILED with: " . $response->message() . " - " . length($response->content()) . " bytes content\n");
+      ++$retries;
     }
     else {
-      print("DONE with: " . $response->message() . " - " . length($response->content()) . " bytes content\n");
+      $timenow = strftime("%FT%T%z", gmtime());
+      push(@{$messages}, "[$timenow] DONE with: " . $response->message() . " - " . length($response->content()) . " bytes content\n");
       # Normal return when things worked
-      return ($request, $response);
+      return ($request, $response, $messages);
     }
   }
-  return ($request, $response);
+  return ($request, $response, $messages);
 }
 
 # Convert an HTTP::Headers object into a structured K/V store
@@ -189,7 +194,26 @@ Usage: $0
     -r, --referers [OPTIONAL]
         A file containing a list of Referer values to randomly select from, one per line.
         If not provided a default build-in list is used.
+    -p, --parallelism [OPTIONAL] DEFAULT=100
+        How many parallel threads to use for making requests; can be relatively high even
+	with a lower core count due to high network latencies. E.g. 100 is good for a slower
+	set of URLs even with just 2 cores.
 EOL
+
+sub worker {
+  my $tid = threads->tid;
+  my ($Qwork, $Qresults) = @_;
+  while (my $work = $Qwork->dequeue()) {
+    my $url = $work->[0];
+    my $url_index = $work->[1];
+    my $start_time_string = strftime("%FT%T%z", gmtime());
+    my ($request, $response, $messages) = make_http_request($url);
+    my $stop_time_string = strftime("%FT%T%z", gmtime());
+    my $result = [$url, $url_index, $start_time_string, $request, $response, $messages, $stop_time_string];
+    $Qresults->enqueue($result);
+  }
+  $Qresults->enqueue(undef);
+}
 
 sub main {
   # Parse arguments
@@ -197,11 +221,13 @@ sub main {
   my $out_dir;
   my $ua_file;
   my $ref_file;
+  my $THREADS = 100;
   GetOptions(
     'url-list|u=s' => \$url_list_file,
     'out-dir|o=s' => \$out_dir,
     'user-agents|a:s' => \$ua_file,
-    'referers|r:s' => \$ref_file)
+    'referers|r:s' => \$ref_file,
+    'parallelism|p:i' => \$THREADS)
   or die $usage;
 
   if (not defined $url_list_file) {
@@ -222,91 +248,109 @@ sub main {
 
   my @urls = @{read_file_lines($url_list_file)};
   my $url_index = 0;
+
+  my $Qwork = new Thread::Queue;
+  my $Qresults = new Thread::Queue;
+  my @pool;
+  for(my $idx = 0; $idx < $THREADS; ++$idx) {
+    push(@pool, threads->create(\&worker, $Qwork, $Qresults));
+  }
+
   my $identifier = File::LibMagic->new();
   foreach my $url (@urls) {
-    my $start_time_string = strftime("%FT%T%Z", gmtime());
-    my ($request, $response) = make_http_request($url);
-    my $stop_time_string = strftime("%FT%T%Z", gmtime());
+    my $work_item = [$url, $url_index];
+    $Qwork->enqueue($work_item);
+    ++$url_index;
+  }
 
-    my $request_headers_map = get_headers_map($request->headers());
-    my $response_headers_map = get_headers_map($response->headers());
-    # charset => none SHOULD return a byte stream (result of Encode)
-    # and only 'decode' transfer encoding (gzip, chunk, etc.) and not charset
-    my $content = $response->decoded_content('charset' => 'none');
-    my ($dest_addr, $dest_port, $src_addr, $src_port);
-    if (defined($response->header('Client-Peer'))) {
-       ($dest_addr, $dest_port) = split(/:([0-9]+)$/, $response->header('Client-Peer'));
-       # Number-ify dest_port
-       $dest_port = $dest_port + 0;
-    }
-    if (defined($response->header('Client-Sock'))) {
-       ($src_addr, $src_port) = split(/:([0-9]+)$/, $response->header('Client-Sock'));
-       # Number-ify src_port
-       $src_port = $src_port + 0;
-    }
+  $Qwork->enqueue((undef) x $THREADS);
 
-    # Create metadata about this download
-    my $result = {
-      'start_timestamp' => $start_time_string,
-      'stop_timestamp' => $stop_time_string,
-      'url' => $url,
-      'source_address' => $src_addr,
-      'source_port' => $src_port,
-      'destination_address' => $dest_addr,
-      'destination_port' => $dest_port,
-      'request_headers' => $request_headers_map,
-      'response_status' => $response->code(),
-      'response_status_message' => $response->message(),
-      'response_headers' => $response_headers_map,
-    };
-    if ($response->code() >= 400 && defined($response->header('Client-Warning'))) {
-      $result->{'content_sha256'} = "INTERNAL_ERROR";
-    }
-    elsif (not defined($content)) {
-      $result->{'content_sha256'} = "NO_CONTENT";
-    }
-    else {
-      $result->{'content_sha256'} = sha256_hex($content);
-      $result->{'libmagic_info'} = $identifier->checktype_contents($content)
-    }
-
-    ## TODO: This should probably be functionized if used more than just these 2 times
-    # Save metadata to file in subdirectory for SHA256 sum named for the index of the URL it came from
-    my $fh = IO::File->new();
-    my $mime_fixed;
-    if (defined($result->{'libmagic_info'})) {
-      $mime_fixed = $result->{'libmagic_info'};
-      $mime_fixed =~ s#/#__#g;
-      $mime_fixed =~ s/;[^;]*//g;
-    }
-    else {
-      $mime_fixed = "NO_MIMETYPE";
-    }
-    my $subdir_name = "$out_dir/$mime_fixed/$result->{'content_sha256'}";
-    if (! -d $subdir_name) {
-      make_path($subdir_name);
-    }
-    my $metafile_name = "$subdir_name/$url_index.json";
-    unless ($fh->open("$metafile_name", "w")) {
-      die "Could not open [ $metafile_name ] for writing: $!\n";
-    }
-    # Only using UTF-8 because we're JSON-ifying, if this were binary data we'd need :raw
-    $fh->binmode(':encoding(UTF-8)');
-    $fh->write(to_json($result, {utf8 => 1, pretty => 1, convert_blessed => 1, canonical => 1})) or die "Failed to write to [ $metafile_name ]: $!\n";
-
-    if (defined($content)) {
-      ## TODO: This should probably be functionized if used more than just these 2 times
-      # Save data to file in subdirectory for SHA256 sum named for the index of the URL it came from
-      my $datafile_name = "$subdir_name/$url_index.dat";
-      $fh = IO::File->new();
-      unless ($fh->open("$datafile_name", "w")) {
-        die "Could not open [ $datafile_name ] for writing: $!\n";
-        $fh->binmode(':raw');
+  for (my $thread_idx = 0; $thread_idx < $THREADS; ++$thread_idx) {
+    while (my $result = $Qresults->dequeue) {
+      my ($url, $url_index, $start_time_string, $request, $response, $messages, $stop_time_string) = @${result};
+      print(join('', @{$messages}));
+      my $request_headers_map = get_headers_map($request->headers());
+      my $response_headers_map = get_headers_map($response->headers());
+      # charset => none SHOULD return a byte stream (result of Encode)
+      # and only 'decode' transfer encoding (gzip, chunk, etc.) and not charset
+      my $content = $response->decoded_content('charset' => 'none');
+      my ($dest_addr, $dest_port, $src_addr, $src_port);
+      if (defined($response->header('Client-Peer'))) {
+         ($dest_addr, $dest_port) = split(/:([0-9]+)$/, $response->header('Client-Peer'));
+         # Number-ify dest_port
+         $dest_port = $dest_port + 0;
       }
-      $fh->write($content) or die "Failed to write to [ $datafile_name ]: $!\n";
-    }
+      if (defined($response->header('Client-Sock'))) {
+         ($src_addr, $src_port) = split(/:([0-9]+)$/, $response->header('Client-Sock'));
+         # Number-ify src_port
+         $src_port = $src_port + 0;
+      }
 
-    $url_index++;
+      # Create metadata about this download
+      my $result = {
+        'start_timestamp' => $start_time_string,
+        'stop_timestamp' => $stop_time_string,
+        'url' => $url,
+        'source_address' => $src_addr,
+        'source_port' => $src_port,
+        'destination_address' => $dest_addr,
+        'destination_port' => $dest_port,
+        'request_headers' => $request_headers_map,
+        'response_status' => $response->code(),
+        'response_status_message' => $response->message(),
+        'response_headers' => $response_headers_map,
+      };
+      if ($response->code() >= 400 && defined($response->header('Client-Warning'))) {
+        $result->{'content_sha256'} = "INTERNAL_ERROR";
+      }
+      elsif (not defined($content)) {
+        $result->{'content_sha256'} = "NO_CONTENT";
+      }
+      else {
+        $result->{'content_sha256'} = sha256_hex($content);
+        $result->{'libmagic_info'} = $identifier->checktype_contents($content)
+      }
+
+      ## TODO: This should probably be functionized if used more than just these 2 times
+      # Save metadata to file in subdirectory for SHA256 sum named for the index of the URL it came from
+      my $fh = IO::File->new();
+      my $mime_fixed;
+      if (defined($result->{'libmagic_info'})) {
+        $mime_fixed = $result->{'libmagic_info'};
+        $mime_fixed =~ s#/#__#g;
+        $mime_fixed =~ s/;[^;]*//g;
+      }
+      else {
+        $mime_fixed = "NO_MIMETYPE";
+      }
+      my $subdir_name = "$out_dir/$mime_fixed/$result->{'content_sha256'}";
+      if (! -d $subdir_name) {
+        make_path($subdir_name);
+      }
+      my $metafile_name = "$subdir_name/$url_index.json";
+      unless ($fh->open("$metafile_name", "w")) {
+        die "Could not open [ $metafile_name ] for writing: $!\n";
+      }
+      # Only using UTF-8 because we're JSON-ifying, if this were binary data we'd need :raw
+      $fh->binmode(':encoding(UTF-8)');
+      $fh->write(to_json($result, {utf8 => 1, pretty => 1, convert_blessed => 1, canonical => 1})) or die "Failed to write to [ $metafile_name ]: $!\n";
+
+      if (defined($content)) {
+        ## TODO: This should probably be functionized if used more than just these 2 times
+        # Save data to file in subdirectory for SHA256 sum named for the index of the URL it came from
+        my $datafile_name = "$subdir_name/$url_index.dat";
+        $fh = IO::File->new();
+        unless ($fh->open("$datafile_name", "w")) {
+          die "Could not open [ $datafile_name ] for writing: $!\n";
+          $fh->binmode(':raw');
+        }
+        $fh->write($content) or die "Failed to write to [ $datafile_name ]: $!\n";
+      }
+    }
+  }
+
+  foreach my $thread (@pool) {
+    $thread->join();
   }
 }
 
