@@ -94,7 +94,7 @@ EOL
 
 my $lastCursorOnPage = undef;
 
-my $dbh = DBI->connect('DBI:SQLite:dbname=:memory:', '', '', { RaiseError => 1 }) or die $DBI::errstr;
+my $dbh = DBI->connect('DBI:SQLite:dbname=/tmp/trinity_portal_data.db', '', '', { RaiseError => 1 }) or die $DBI::errstr;
 if ($dbh->do('CREATE TABLE tc_correlate (action_time TEXT, host TEXT, path TEXT, user_agent TEXT, formula_id INTEGER, source TEXT, source_port INTEGER, destination TEXT, destination_port INTEGER)') < 0) {
   die $DBI::errstr;
 }
@@ -151,6 +151,9 @@ while ($haveMorePages) {
 $dbh->commit();
 
 my $results;
+my $earliest_start = 1 << 63;
+my $latest_stop = 0;
+
 
 my $idx = 1;
 sub find_json_check {
@@ -173,11 +176,17 @@ sub find_json_check {
       $path = $2;
     }
     $path = '/' unless defined $path;
-    # Account for partial seconds in actino time / clock skew
+    # Account for partial seconds in action time / clock skew
     my @start_time = Date::Parse::strptime($json->{'start_timestamp'});
     $start_time[1] -= 15;
+    # Compute total start/stop times with adjustment for clock skew in place
+    my $start_epoch = int(strftime("%s", @start_time));
+    $earliest_start = $start_epoch if $start_epoch < $earliest_start;
     my @stop_time = Date::Parse::strptime($json->{'stop_timestamp'});
     $stop_time[1] += 15;
+    # Compute total start/stop times with adjustment for clock skew in place
+    my $stop_epoch = int(strftime("%s", @stop_time));
+    $latest_stop = $stop_epoch if $stop_epoch > $latest_stop;
     my $sth = $dbh->prepare('SELECT formula_id, host, path, user_agent, action_time, source, source_port, destination, destination_port FROM tc_correlate WHERE host like ? AND path like ? AND INSTR(?, user_agent) > 0 AND action_time BETWEEN ? AND ?');
     $sth->bind_param(1, $host);
     $sth->bind_param(2, $path);
@@ -200,5 +209,19 @@ sub find_json_check {
 }
 
 find({'wanted' => \&find_json_check, 'no_chdir' => 1}, $input_dir);
+
+
+my @start_time = Date::Parse::strptime($earliest_start);
+my @stop_time = Date::Parse::strptime($latest_stop);
+
+print @start_time . "\n";
+print @stop_time . "\n";
+my $fid_summary = $dbh->selectall_arrayref('SELECT formula_id, count(formula_id) as cnt FROM tc_correlate WHERE action_time BETWEEN ?  AND ? GROUP BY formula_id ORDER BY cnt desc, formula_id desc', {}, strftime("%FT%T", @start_time), strftime("%FT%T", @stop_time));
+foreach my $fid (@{$fid_summary}) {
+    printf("%6d  Formula ID: %09d", $fid->[0], $fid->[1]);
+}
+
+
+
 
 $dbh->disconnect();
