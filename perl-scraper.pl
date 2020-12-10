@@ -237,6 +237,13 @@ sub main {
     die("-o, --out-dir is required but not supplied!\n$usage");
   }
 
+  my $Qwork = new Thread::Queue;
+  my $Qresults = new Thread::Queue;
+  my @pool;
+  for(my $idx = 0; $idx < $THREADS; ++$idx) {
+    push(@pool, threads->create(\&worker, $Qwork, $Qresults));
+  }
+
   my $urls = read_file_lines($url_list_file);
   if (defined($ua_file)) {
     @USER_AGENTS = @{read_file_lines($ua_file)};
@@ -248,13 +255,6 @@ sub main {
 
   my @urls = @{read_file_lines($url_list_file)};
   my $url_index = 0;
-
-  my $Qwork = new Thread::Queue;
-  my $Qresults = new Thread::Queue;
-  my @pool;
-  for(my $idx = 0; $idx < $THREADS; ++$idx) {
-    push(@pool, threads->create(\&worker, $Qwork, $Qresults));
-  }
 
   my $identifier = File::LibMagic->new();
   foreach my $url (@urls) {
