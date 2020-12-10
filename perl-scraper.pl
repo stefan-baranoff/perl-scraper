@@ -221,12 +221,14 @@ sub main {
   my $out_dir;
   my $ua_file;
   my $ref_file;
+  my $save_content;
   my $THREADS = 100;
   GetOptions(
     'url-list|u=s' => \$url_list_file,
     'out-dir|o=s' => \$out_dir,
     'user-agents|a:s' => \$ua_file,
     'referers|r:s' => \$ref_file,
+    'content|c!' => \$save_content,
     'parallelism|p:i' => \$THREADS)
   or die $usage;
 
@@ -335,7 +337,7 @@ sub main {
       $fh->binmode(':encoding(UTF-8)');
       $fh->write(to_json($result, {utf8 => 1, pretty => 1, convert_blessed => 1, canonical => 1})) or die "Failed to write to [ $metafile_name ]: $!\n";
 
-      if (defined($content)) {
+      if (defined($content) and $save_content) {
         ## TODO: This should probably be functionized if used more than just these 2 times
         # Save data to file in subdirectory for SHA256 sum named for the index of the URL it came from
         my $datafile_name = "$subdir_name/$url_index.dat";
