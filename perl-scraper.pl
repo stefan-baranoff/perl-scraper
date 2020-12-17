@@ -13,6 +13,7 @@ use File::Path 'make_path';
 use JSON;
 use IO::Socket::SSL;
 use Thread::Queue;
+use Text::CSV 'csv';
 
 # Monkey-patch LWP::Protocol::http to get local address/port information along with remote information
 BEGIN {
@@ -204,12 +205,12 @@ sub worker {
   my $tid = threads->tid;
   my ($Qwork, $Qresults) = @_;
   while (my $work = $Qwork->dequeue()) {
-    my $url = $work->[0];
+    my $url_meta = $work->[0];
     my $url_index = $work->[1];
     my $start_time_string = strftime("%FT%T%z", gmtime());
-    my ($request, $response, $messages) = make_http_request($url);
+    my ($request, $response, $messages) = make_http_request($url_meta->{'url'});
     my $stop_time_string = strftime("%FT%T%z", gmtime());
-    my $result = [$url, $url_index, $start_time_string, $request, $response, $messages, $stop_time_string];
+    my $result = [$url_meta, $url_index, $start_time_string, $request, $response, $messages, $stop_time_string];
     $Qresults->enqueue($result);
   }
   $Qresults->enqueue(undef);
@@ -221,7 +222,8 @@ sub main {
   my $out_dir;
   my $ua_file;
   my $ref_file;
-  my $save_content;
+  my $save_content = 1;
+  my $is_csv = 0;
   my $THREADS = 100;
   GetOptions(
     'url-list|u=s' => \$url_list_file,
@@ -229,6 +231,7 @@ sub main {
     'user-agents|a:s' => \$ua_file,
     'referers|r:s' => \$ref_file,
     'content|c!' => \$save_content,
+    'csv|s!' => \$is_csv,
     'parallelism|p:i' => \$THREADS)
   or die $usage;
 
@@ -246,7 +249,15 @@ sub main {
     push(@pool, threads->create(\&worker, $Qwork, $Qresults));
   }
 
-  my $urls = read_file_lines($url_list_file);
+  my $urls = [];
+  if (not $is_csv) {
+    foreach my $line (@{read_file_lines($url_list_file)}) {
+      push(@{$urls}, {'url' => $line});
+    }
+  }
+  else {
+    $urls = csv (in => $url_list_file, headers => 'auto');
+  }
   if (defined($ua_file)) {
     @USER_AGENTS = @{read_file_lines($ua_file)};
   }
@@ -255,11 +266,10 @@ sub main {
   }
   ensure_outdir($out_dir);
 
-  my @urls = @{read_file_lines($url_list_file)};
   my $url_index = 0;
 
   my $identifier = File::LibMagic->new();
-  foreach my $url (@urls) {
+  foreach my $url (@{$urls}) {
     my $work_item = [$url, $url_index];
     $Qwork->enqueue($work_item);
     ++$url_index;
@@ -269,7 +279,7 @@ sub main {
 
   for (my $thread_idx = 0; $thread_idx < $THREADS; ++$thread_idx) {
     while (my $result = $Qresults->dequeue) {
-      my ($url, $url_index, $start_time_string, $request, $response, $messages, $stop_time_string) = @${result};
+      my ($url_meta, $url_index, $start_time_string, $request, $response, $messages, $stop_time_string) = @${result};
       print(join('', @{$messages}));
       my $request_headers_map = get_headers_map($request->headers());
       my $response_headers_map = get_headers_map($response->headers());
@@ -287,12 +297,12 @@ sub main {
          # Number-ify src_port
          $src_port = $src_port + 0;
       }
-
+      my %tl_url_meta = %{$url_meta};
       # Create metadata about this download
       my $result = {
         'start_timestamp' => $start_time_string,
         'stop_timestamp' => $stop_time_string,
-        'url' => $url,
+        'url' => $tl_url_meta{'url'},
         'source_address' => $src_addr,
         'source_port' => $src_port,
         'destination_address' => $dest_addr,
@@ -302,6 +312,14 @@ sub main {
         'response_status_message' => $response->message(),
         'response_headers' => $response_headers_map,
       };
+      delete $tl_url_meta{'url'};
+      my @split_tags;
+      if (exists($tl_url_meta{'tags'})) {
+        @split_tags = split(/\s*,\s*/, $tl_url_meta{'tags'});
+	$tl_url_meta{'tags'} = \@split_tags;
+      }
+      $result->{'url_meta'} = \%tl_url_meta;
+
       if ($response->code() >= 400 && defined($response->header('Client-Warning'))) {
         $result->{'content_sha256'} = "INTERNAL_ERROR";
       }
