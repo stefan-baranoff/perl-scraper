@@ -15,6 +15,11 @@ use IO::Socket::SSL;
 use Thread::Queue;
 use Text::CSV 'csv';
 
+my $last_peer_host = undef;
+my $last_peer_port = undef;
+my $last_sock_host = undef;
+my $last_sock_port = undef;
+
 # Monkey-patch LWP::Protocol::http to get local address/port information along with remote information
 BEGIN {
   use LWP::Protocol::http;
@@ -29,6 +34,138 @@ BEGIN {
           $res->header("Client-Sock" => "$sockhost:" . $sock->sockport);
       }
   };
+
+  use IO::Socket::INET;
+  use Socket;
+  my $EINVAL = exists(&Errno::EINVAL) ? Errno::EINVAL() : 1;
+
+  my %socket_type = ( tcp  => SOCK_STREAM,
+                      udp  => SOCK_DGRAM,
+                      icmp => SOCK_RAW
+                    );
+  *IO::Socket::INET::configure = sub {
+     my($sock,$arg) = @_;
+     my($lport,$rport,$laddr,$raddr,$proto,$type);
+
+
+     $arg->{LocalAddr} = $arg->{LocalHost}
+         if exists $arg->{LocalHost} && !exists $arg->{LocalAddr};
+
+     ($laddr,$lport,$proto) = IO::Socket::INET::_sock_info($arg->{LocalAddr},
+                                         $arg->{LocalPort},
+                                         $arg->{Proto})
+                         or return IO::Socket::INET::_error($sock, $!, $@);
+
+     $laddr = defined $laddr ? inet_aton($laddr)
+                             : INADDR_ANY;
+
+     return IO::Socket::INET::_error($sock, $EINVAL, "Bad hostname '",$arg->{LocalAddr},"'")
+         unless(defined $laddr);
+
+     $arg->{PeerAddr} = $arg->{PeerHost}
+         if exists $arg->{PeerHost} && !exists $arg->{PeerAddr};
+
+     unless(exists $arg->{Listen}) {
+         ($raddr,$rport,$proto) = IO::Socket::INET::_sock_info($arg->{PeerAddr},
+                                             $arg->{PeerPort},
+                                             $proto)
+                         or return IO::Socket::INET::_error($sock, $!, $@);
+     }
+
+     $proto ||= IO::Socket::INET::_get_proto_number('tcp');
+
+     $type = $arg->{Type} || $socket_type{lc IO::Socket::INET::_get_proto_name($proto)};
+
+     my @raddr = ();
+
+     if(defined $raddr) {
+         @raddr = $sock->_get_addr($raddr, $arg->{MultiHomed});
+         return IO::Socket::INET::_error($sock, $EINVAL, "Bad hostname '",$arg->{PeerAddr},"'")
+             unless @raddr;
+     }
+
+     while(1) {
+
+         $sock->socket(AF_INET, $type, $proto) or
+             return IO::Socket::INET::_error($sock, $!, "$!");
+
+         if (defined $arg->{Blocking}) {
+             defined $sock->blocking($arg->{Blocking})
+                 or return IO::Socket::INET::_error($sock, $!, "$!");
+         }
+
+         if ($arg->{Reuse} || $arg->{ReuseAddr}) {
+             $sock->sockopt(SO_REUSEADDR,1) or
+                     return IO::Socket::INET::_error($sock, $!, "$!");
+         }
+
+         if ($arg->{ReusePort}) {
+             $sock->sockopt(SO_REUSEPORT,1) or
+                     return IO::Socket::INET::_error($sock, $!, "$!");
+         }
+
+         if ($arg->{Broadcast}) {
+                 $sock->sockopt(SO_BROADCAST,1) or
+                     return IO::Socket::INET::_error($sock, $!, "$!");
+         }
+
+         if($lport || ($laddr ne INADDR_ANY) || exists $arg->{Listen}) {
+             $sock->bind($lport || 0, $laddr) or
+                     return IO::Socket::INET::_error($sock, $!, "$!");
+         }
+
+         if(exists $arg->{Listen}) {
+             $sock->listen($arg->{Listen} || 5) or
+                 return IO::Socket::INET::_error($sock, $!, "$!");
+             last;
+         }
+
+          # don't try to connect unless we're given a PeerAddr
+          last unless exists($arg->{PeerAddr});
+ 
+         $raddr = shift @raddr;
+
+         return IO::Socket::INET::_error($sock, $EINVAL, 'Cannot determine remote port')
+                 unless($rport || $type == SOCK_DGRAM || $type == SOCK_RAW);
+
+         last
+             unless($type == SOCK_STREAM || defined $raddr);
+
+         return IO::Socket::INET::_error($sock, $EINVAL, "Bad hostname '",$arg->{PeerAddr},"'")
+             unless defined $raddr;
+
+#         my $timeout = ${*$sock}{'io_socket_timeout'};
+#         my $before = time() if $timeout;
+
+         undef $@;
+         if ($sock->connect(pack_sockaddr_in($rport, $raddr))) {
+             #${*$sock}{'io_socket_timeout'} = $timeout;
+             ($last_sock_port, $last_sock_host) = unpack_sockaddr_in($sock->sockname());
+             ($last_peer_port, $last_peer_host) = unpack_sockaddr_in($sock->peername());
+             $last_sock_host = inet_ntoa($last_sock_host);
+             $last_peer_host = inet_ntoa($last_peer_host);
+             return $sock;
+         }
+         ($last_sock_port, $last_sock_host) = unpack_sockaddr_in($sock->sockname());
+         ($last_peer_port, $last_peer_host) = unpack_sockaddr_in($sock->peername());
+         $last_sock_host = inet_ntoa($last_sock_host);
+         $last_peer_host = inet_ntoa($last_peer_host);
+         return IO::Socket::INET::_error($sock, $!, $@ || "Timeout")
+             unless @raddr;
+
+#         if ($timeout) {
+#             my $new_timeout = $timeout - (time() - $before);
+#             return IO::Socket::INET::_error($sock,
+#                           (exists(&Errno::ETIMEDOUT) ? Errno::ETIMEDOUT() : $EINVAL),
+#                           "Timeout") if $new_timeout <= 0;
+#             ${*$sock}{'io_socket_timeout'} = $new_timeout;
+#          }
+
+      }
+
+      $sock;
+  };
+
   use warnings 'redefine';
 }
 
@@ -136,7 +273,17 @@ sub make_http_request {
     $request = get_request($url);
     my $timenow = strftime("%FT%T%z", gmtime());
     push(@{$messages}, "[$timenow] Try ${retries} - requesting [ $url ]... ");
+    $last_peer_host = undef;
+    $last_peer_port = undef;
+    $last_sock_host = undef;
+    $last_sock_port = undef;
     $response = $ua->request($request);
+    if (defined($last_peer_host)) {
+       $response->header('Client-Peer-Hack', "$last_peer_host:$last_peer_port");
+    }
+    if (defined($last_sock_host)) {
+       $response->header('Client-Sock-Hack', "$last_sock_host:$last_sock_port");
+    }
     if (not $response->is_success()) {
       $timenow = strftime("%FT%T%z", gmtime());
       push(@{$messages}, "[$timenow] FAILED with: " . $response->message() . " - " . length($response->content()) . " bytes content\n");
@@ -197,8 +344,8 @@ Usage: $0
         If not provided a default build-in list is used.
     -p, --parallelism [OPTIONAL] DEFAULT=100
         How many parallel threads to use for making requests; can be relatively high even
-	with a lower core count due to high network latencies. E.g. 100 is good for a slower
-	set of URLs even with just 2 cores.
+        with a lower core count due to high network latencies. E.g. 100 is good for a slower
+        set of URLs even with just 2 cores.
 EOL
 
 sub worker {
@@ -316,7 +463,7 @@ sub main {
       my @split_tags;
       if (exists($tl_url_meta{'tags'})) {
         @split_tags = split(/\s*,\s*/, $tl_url_meta{'tags'});
-	$tl_url_meta{'tags'} = \@split_tags;
+        $tl_url_meta{'tags'} = \@split_tags;
       }
       $result->{'url_meta'} = \%tl_url_meta;
 

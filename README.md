@@ -4,7 +4,7 @@
 If you're on CentOS there's an EPEL provided File::LibMagic (maybe there's one in CentOS 8 I'm missing) but it has an older API. These should work -- the second yum install is to ensure epel-release installed properly
 
 ```
-sudo yum install -y perl-LWP-Protocol-https perl-JSON cpan file-devel epel-release perl-Thread-Queue && sudo yum install -y perl-File-LibMagic
+sudo yum install -y perl-LWP-Protocol-https perl-JSON cpan file-devel epel-release perl-Thread-Queue perl-Text-CSV && sudo yum install -y perl-File-LibMagic
 ```
 ## Running
 This is pretty self explanatory
