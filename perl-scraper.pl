@@ -15,10 +15,10 @@ use IO::Socket::SSL;
 use Thread::Queue;
 use Text::CSV 'csv';
 
-my $last_peer_host = undef;
-my $last_peer_port = undef;
-my $last_sock_host = undef;
-my $last_sock_port = undef;
+my @last_inet_peer = ();
+my @last_inet_sock = ();
+my @last_ip_peer = ();
+my @last_ip_sock = ();
 
 # Monkey-patch LWP::Protocol::http to get local address/port information along with remote information
 BEGIN {
@@ -138,18 +138,15 @@ BEGIN {
 #         my $before = time() if $timeout;
 
          undef $@;
-         if ($sock->connect(pack_sockaddr_in($rport, $raddr))) {
+         my $connected = $sock->connect(pack_sockaddr_in($rport, $raddr));
+         @last_inet_sock = unpack_sockaddr_in($sock->sockname());
+         @last_inet_peer = unpack_sockaddr_in($sock->peername());
+         $last_inet_sock[1] = inet_ntoa($last_inet_sock[1]);
+         $last_inet_peer[1] = inet_ntoa($last_inet_peer[1]);
+         if ($connected) {
              #${*$sock}{'io_socket_timeout'} = $timeout;
-             ($last_sock_port, $last_sock_host) = unpack_sockaddr_in($sock->sockname());
-             ($last_peer_port, $last_peer_host) = unpack_sockaddr_in($sock->peername());
-             $last_sock_host = inet_ntoa($last_sock_host);
-             $last_peer_host = inet_ntoa($last_peer_host);
              return $sock;
          }
-         ($last_sock_port, $last_sock_host) = unpack_sockaddr_in($sock->sockname());
-         ($last_peer_port, $last_peer_host) = unpack_sockaddr_in($sock->peername());
-         $last_sock_host = inet_ntoa($last_sock_host);
-         $last_peer_host = inet_ntoa($last_peer_host);
          return IO::Socket::INET::_error($sock, $!, $@ || "Timeout")
              unless @raddr;
 
@@ -164,6 +161,49 @@ BEGIN {
       }
 
       $sock;
+  };
+
+  use IO::Socket::IP;
+  use Errno qw( EINVAL EINPROGRESS EISCONN );
+  *IO::Socket::IP::connect = sub {
+    my $self = shift;
+
+    # It seems that IO::Socket hides EINPROGRESS errors, making them look like
+    # a success. This is annoying here.
+    # Instead of putting up with its frankly-irritating intentional breakage of
+    # useful APIs I'm just going to end-run around it and call CORE::connect()
+    # directly
+
+    if (@_) {
+      my $retval = CORE::connect( $self, $_[0] );
+      @last_ip_sock = $self->sockhost_service(1);
+      @last_ip_peer = $self->peerhost_service(1);
+    } 
+
+    return 1 if !${*$self}{io_socket_ip_connect_in_progress};
+
+    # See if a connect attempt has just failed with an error
+    if( my $errno = $self->getsockopt( SOL_SOCKET, SO_ERROR ) ) {
+      delete ${*$self}{io_socket_ip_connect_in_progress};
+      ${*$self}{io_socket_ip_errors}[0] = $! = $errno;
+      return $self->setup;
+    }
+
+    # No error, so either connect is still in progress, or has completed
+    # successfully. We can tell by trying to connect() again; either it will
+    # succeed or we'll get EISCONN (connected successfully), or EALREADY
+    # (still in progress). This even works on MSWin32.
+    my $addr = ${*$self}{io_socket_ip_infos}[${*$self}{io_socket_ip_idx}]{peeraddr};
+
+    if( $self->connect( $addr ) or $! == EISCONN ) {
+      delete ${*$self}{io_socket_ip_connect_in_progress};
+      $! = 0;
+      return 1;
+    }
+    else {
+      $! = EINPROGRESS;
+      return 0;
+    }
   };
 
   use warnings 'redefine';
@@ -273,16 +313,22 @@ sub make_http_request {
     $request = get_request($url);
     my $timenow = strftime("%FT%T%z", gmtime());
     push(@{$messages}, "[$timenow] Try ${retries} - requesting [ $url ]... ");
-    $last_peer_host = undef;
-    $last_peer_port = undef;
-    $last_sock_host = undef;
-    $last_sock_port = undef;
+    @last_inet_peer = ();
+    @last_inet_sock = ();
+    @last_ip_peer = ();
+    @last_ip_sock = ();
     $response = $ua->request($request);
-    if (defined($last_peer_host)) {
-       $response->header('Client-Peer-Hack', "$last_peer_host:$last_peer_port");
+    if (@last_inet_peer) {
+       $response->header('Client-Peer-INET', "$last_inet_peer[1]:$last_inet_peer[0]");
     }
-    if (defined($last_sock_host)) {
-       $response->header('Client-Sock-Hack', "$last_sock_host:$last_sock_port");
+    if (@last_inet_sock) {
+       $response->header('Client-Sock-INET', "$last_inet_sock[1]:$last_inet_sock[0]");
+    }
+    if (@last_ip_peer) {
+       $response->header('Client-Peer-IP', "$last_ip_peer[0]:$last_ip_peer[1]");
+    }
+    if (@last_ip_sock) {
+       $response->header('Client-Sock-IP', "$last_ip_sock[0]:$last_ip_sock[1]");
     }
     if (not $response->is_success()) {
       $timenow = strftime("%FT%T%z", gmtime());
