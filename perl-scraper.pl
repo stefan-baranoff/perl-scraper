@@ -139,10 +139,12 @@ BEGIN {
 
          undef $@;
          my $connected = $sock->connect(pack_sockaddr_in($rport, $raddr));
-         @last_inet_sock = unpack_sockaddr_in($sock->sockname());
-         @last_inet_peer = unpack_sockaddr_in($sock->peername());
-         $last_inet_sock[1] = inet_ntoa($last_inet_sock[1]);
-         $last_inet_peer[1] = inet_ntoa($last_inet_peer[1]);
+         my @this_inet_sock = unpack_sockaddr_in($sock->sockname());
+         my @this_inet_peer = unpack_sockaddr_in($sock->peername());
+         $this_inet_sock[1] = inet_ntoa($this_inet_sock[1]);
+         $this_inet_peer[1] = inet_ntoa($this_inet_peer[1]);
+	 push(@last_inet_sock, "$this_inet_sock[1]:$this_inet_sock[0]");
+	 push(@last_inet_peer, "$this_inet_peer[1]:$this_inet_peer[0]");
          if ($connected) {
              #${*$sock}{'io_socket_timeout'} = $timeout;
              return $sock;
@@ -164,7 +166,7 @@ BEGIN {
   };
 
   use IO::Socket::IP;
-  use Errno qw( EINVAL EINPROGRESS EISCONN );
+  use Errno qw( EINVAL EINPROGRESS EISCONN ENOTCONN ETIMEDOUT EWOULDBLOCK EOPNOTSUPP );
   *IO::Socket::IP::connect = sub {
     my $self = shift;
 
@@ -174,18 +176,76 @@ BEGIN {
     # useful APIs I'm just going to end-run around it and call CORE::connect()
     # directly
 
-    if (@_) {
-      my $retval = CORE::connect( $self, $_[0] );
-      @last_ip_sock = $self->sockhost_service(1);
-      @last_ip_peer = $self->peerhost_service(1);
-    } 
+    if( @_ ) {
+      my ( $addr ) = @_;
 
-    return 1 if !${*$self}{io_socket_ip_connect_in_progress};
+      # Annoyingly IO::Socket's connect() is where the timeout logic is
+      # implemented, so we'll have to reinvent it here
+      my $timeout = ${*$self}{'io_socket_timeout'};
+
+      if ( not defined $timeout ) {
+        my $retval = connect( $self, $addr );
+        push(@last_ip_sock, $self->join_addr($self->sockhost_service(1)));
+        push(@last_ip_peer, $self->join_addr($self->peerhost_service(1)));
+        return $retval;
+      }
+
+      my $was_blocking = $self->blocking( 0 );
+
+      my $err = defined connect( $self, $addr ) ? 0 : $!+0;
+
+      if( !$err ) {
+        push(@last_ip_sock, $self->join_addr($self->sockhost_service(1)));
+        push(@last_ip_peer, $self->join_addr($self->peerhost_service(1)));
+        # All happy
+        $self->blocking( $was_blocking );
+        return 1;
+      }
+      elsif( not( $err == EINPROGRESS or $err == EWOULDBLOCK ) ) {
+        push(@last_ip_sock, $self->join_addr($self->sockhost_service(1)));
+        push(@last_ip_peer, $self->join_addr($self->peerhost_service(1)));
+        # Failed for some other reason
+        $self->blocking( $was_blocking );
+        return undef;
+      }
+      elsif( !$was_blocking ) {
+        # We shouldn't block anyway
+        return undef;
+      }
+
+      my $vec = ''; vec( $vec, $self->fileno, 1 ) = 1;
+      if( !select( undef, $vec, $vec, $timeout ) ) {
+        $self->blocking( $was_blocking );
+        $! = ETIMEDOUT;
+        push(@last_ip_sock, $self->join_addr($self->sockhost_service(1)));
+        push(@last_ip_peer, $self->join_addr($self->peerhost_service(1)));
+        return undef;
+      }
+
+      # Hoist the error by connect()ing a second time
+      $err = $self->getsockopt( SOL_SOCKET, SO_ERROR );
+      $err = 0 if $err == EISCONN; # Some OSes give EISCONN
+
+      $self->blocking( $was_blocking );
+
+      push(@last_ip_sock, $self->join_addr($self->sockhost_service(1)));
+      push(@last_ip_peer, $self->join_addr($self->peerhost_service(1)));
+      $! = $err, return undef if $err;
+      return 1;
+    }
+
+    if (!${*$self}{io_socket_ip_connect_in_progress}) {
+      push(@last_ip_sock, $self->join_addr($self->sockhost_service(1)));
+      push(@last_ip_peer, $self->join_addr($self->peerhost_service(1)));
+      return 1;
+    }
 
     # See if a connect attempt has just failed with an error
     if( my $errno = $self->getsockopt( SOL_SOCKET, SO_ERROR ) ) {
       delete ${*$self}{io_socket_ip_connect_in_progress};
       ${*$self}{io_socket_ip_errors}[0] = $! = $errno;
+      push(@last_ip_sock, $self->join_addr($self->sockhost_service(1)));
+      push(@last_ip_peer, $self->join_addr($self->peerhost_service(1)));
       return $self->setup;
     }
 
@@ -195,7 +255,9 @@ BEGIN {
     # (still in progress). This even works on MSWin32.
     my $addr = ${*$self}{io_socket_ip_infos}[${*$self}{io_socket_ip_idx}]{peeraddr};
 
-    if( $self->connect( $addr ) or $! == EISCONN ) {
+    if( connect( $self, $addr ) or $! == EISCONN ) {
+      push(@last_ip_sock, $self->join_addr($self->sockhost_service(1)));
+      push(@last_ip_peer, $self->join_addr($self->peerhost_service(1)));
       delete ${*$self}{io_socket_ip_connect_in_progress};
       $! = 0;
       return 1;
@@ -318,18 +380,10 @@ sub make_http_request {
     @last_ip_peer = ();
     @last_ip_sock = ();
     $response = $ua->request($request);
-    if (@last_inet_peer) {
-       $response->header('Client-Peer-INET', "$last_inet_peer[1]:$last_inet_peer[0]");
-    }
-    if (@last_inet_sock) {
-       $response->header('Client-Sock-INET', "$last_inet_sock[1]:$last_inet_sock[0]");
-    }
-    if (@last_ip_peer) {
-       $response->header('Client-Peer-IP', "$last_ip_peer[0]:$last_ip_peer[1]");
-    }
-    if (@last_ip_sock) {
-       $response->header('Client-Sock-IP', "$last_ip_sock[0]:$last_ip_sock[1]");
-    }
+    $response->header('Client-Peer-INET', \@last_inet_peer);
+    $response->header('Client-Sock-INET', \@last_inet_sock);
+    $response->header('Client-Peer-IP', \@last_ip_peer);
+    $response->header('Client-Sock-IP', \@last_ip_sock);
     if (not $response->is_success()) {
       $timenow = strftime("%FT%T%z", gmtime());
       push(@{$messages}, "[$timenow] FAILED with: " . $response->message() . " - " . length($response->content()) . " bytes content\n");
